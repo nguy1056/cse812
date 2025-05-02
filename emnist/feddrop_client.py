@@ -4,13 +4,14 @@ from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.common import Code, EvaluateIns, EvaluateRes, FitRes, Status
 # other dependecies:
 from models import CNN
-import torch
+import torch, time
 from torch.utils.data import DataLoader, random_split
 from typing import Dict
-from util import set_filters, get_filters, merge_subnet
+from util import set_filters, get_filters, merge_subnet, params_bytes
 from flwr.common import Code, EvaluateIns, EvaluateRes, FitIns, FitRes, Status
 import numpy as np
 from typing import List
+
 
 DEVICE = torch.device('cpu')
 CLASSES = 62
@@ -43,11 +44,27 @@ class feddrop_client(fl.client.Client):
         masked_params =self.mask_channels(drop_info, model_params=merged_params)
         # Update local model, train, get updated parameters
         set_filters(self.model, masked_params)
+        tic = time.perf_counter()
         self.train()
+        train_time = time.perf_counter() - tic
+
         # Serialize ndarray's into a Parameters object
-        parameters_updated = self.get_updated_parameters(drop_info)
+        updated_nd = self.get_updated_parameters(drop_info)
+        upload_bytes = params_bytes(updated_nd)
+        download_bytes = params_bytes(parameters_to_ndarrays(ins.parameters))
+
         status = Status(code=Code.OK, message="Success")
-        return FitRes(status=status, parameters=ndarrays_to_parameters(parameters_updated), num_examples=len(self.trainloader), metrics={"drop_info":drop_info},)
+        return FitRes(
+            status=status,
+            parameters=ndarrays_to_parameters(updated_nd),
+            num_examples=len(self.trainloader),
+            metrics={
+                "upload_bytes": upload_bytes,
+                "download_bytes": download_bytes,
+                "train_time": train_time,
+                "drop_info": drop_info,
+            },
+        )
     
     def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
         # Deserialize parameters to NumPy ndarray's

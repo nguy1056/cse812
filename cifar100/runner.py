@@ -71,40 +71,40 @@ for i in range(NUM_SIMS):
                 # write each item on a new line
                 fp.write("%f\n" % item)
 
-for i in range(NUM_SIMS):
-    randseed = random.randint(0, 99999)
-    random.seed(randseed)
-    test_acc = []
-    selected_clients = []
-    strategy = fedprox_strategy(FF, FE, MFC, MEC, MAC, ACC=test_acc, ClientsSelection=selected_clients)
-    fl.simulation.start_simulation(
-        client_fn=fedprox_client_fn,
-        num_clients=MAC,
-        config=fl.server.ServerConfig(num_rounds=ROUNDS),
-        strategy=strategy
-    )
+# for i in range(NUM_SIMS):
+#     randseed = random.randint(0, 99999)
+#     random.seed(randseed)
+#     test_acc = []
+#     selected_clients = []
+#     strategy = fedprox_strategy(FF, FE, MFC, MEC, MAC, ACC=test_acc, ClientsSelection=selected_clients)
+#     fl.simulation.start_simulation(
+#         client_fn=fedprox_client_fn,
+#         num_clients=MAC,
+#         config=fl.server.ServerConfig(num_rounds=ROUNDS),
+#         strategy=strategy
+#     )
     
-    now = datetime.now()
-    with open('results/fedprox_accuracies_alpha0.1_' + now.strftime("%Y%m%d%H%M") + '.txt', 'w') as fp:
-            for item in test_acc:
-                # write each item on a new line
-                fp.write("%f\n" % item)
+#     now = datetime.now()
+#     with open('results/fedprox_accuracies_alpha0.1_' + now.strftime("%Y%m%d%H%M") + '.txt', 'w') as fp:
+#             for item in test_acc:
+#                 # write each item on a new line
+#                 fp.write("%f\n" % item)
 
-for i in range(NUM_SIMS):
-    randseed = random.randint(0, 99999)
-    random.seed(randseed)
-    test_acc = []
-    selected_clients = []
-    strategy = dropout_strategy(FF, FE, MFC, MEC, MAC, ACC=test_acc, ClientsSelection=selected_clients)
-    fl.simulation.start_simulation(
-        client_fn=feddrop_client_fn,
-        num_clients=MAC,
-        config=fl.server.ServerConfig(num_rounds=ROUNDS),
-        strategy=strategy
-    )
+# for i in range(NUM_SIMS):
+#     randseed = random.randint(0, 99999)
+#     random.seed(randseed)
+#     test_acc = []
+#     selected_clients = []
+#     strategy = dropout_strategy(FF, FE, MFC, MEC, MAC, ACC=test_acc, ClientsSelection=selected_clients)
+#     fl.simulation.start_simulation(
+#         client_fn=feddrop_client_fn,
+#         num_clients=MAC,
+#         config=fl.server.ServerConfig(num_rounds=ROUNDS),
+#         strategy=strategy
+#     )
     
-    now = datetime.now()
-    with open('results/feddrop_accuracies_alpha0.1_' + now.strftime("%Y%m%d%H%M") + '.txt', 'w') as fp:
-            for item in test_acc:
-                # write each item on a new line
-                fp.write("%f\n" % item)
+#     now = datetime.now()
+#     with open('results/feddrop_accuracies_alpha0.1_' + now.strftime("%Y%m%d%H%M") + '.txt', 'w') as fp:
+#             for item in test_acc:
+#                 # write each item on a new line
+#                 fp.write("%f\n" % item)

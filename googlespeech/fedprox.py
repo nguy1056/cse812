@@ -14,9 +14,33 @@ from flwr.common.logger import log
 from logging import WARNING
 from dataset import voice_dataset
 from util import get_filters, get_parameters, set_filters, parameters_to_ndarrays
+import logging
+import sys
+import os
+import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("training.log"),     # Write to log file
+        logging.StreamHandler(sys.stdout),       # Also print to console
+    ]
+)
+
+logger = logging.getLogger()
+
+# Create the 'results' folder if it doesn't exist
+os.makedirs("results", exist_ok=True)
+# Generate a unique timestamped filename
+timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+log_filename = f"results/FedProx_{timestamp_str}.txt"
+
 CHANNEL = 1
 Batch = 16
 CLASSES = 35
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class fedprox_strategy(fl.server.strategy.FedAvg):
     def __init__(self, ff, fe, mfc, mec, mac, ACC=[], ClientsSelection=[]):
@@ -28,6 +52,11 @@ class fedprox_strategy(fl.server.strategy.FedAvg):
         self.min_available_clients_=mac
         self.global_model = CNN(CHANNEL, outputs=CLASSES)
         self.accuracy_record = ACC
+
+        self._round_resource: Dict[int, Dict[str, float]] = {}
+        self.total_bytes = 0     # cumulative
+        self.total_wall  = 0.0
+        self.efficiency_log: List[Tuple[int, float, float]] = []
 
     def record_test_accuracy(self, acc):
         self.accuracy_record.append(acc)
@@ -59,10 +88,16 @@ class fedprox_strategy(fl.server.strategy.FedAvg):
       if not self.accept_failures and failures:
         return None, {}
       # Convert results
+      bytes_up = bytes_down = 0
+      wall = 0.0
       Fit_res = []
       for client, fit_res in results:
         cid = client.cid
+        m = fit_res.metrics
         param, num = parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples
+        bytes_up += int(m.get("upload_bytes", 0))
+        bytes_down += int(m.get("download_bytes", 0))
+        wall += float(m.get("train_time", 0.0))
         Fit_res.append((param, num))
       #for params, size, rate in weights_results:
       new_model = aggregate(Fit_res)
@@ -74,6 +109,12 @@ class fedprox_strategy(fl.server.strategy.FedAvg):
       elif server_round == 1:  # Only log this warning once
           log(WARNING, "No fit_metrics_aggregation_fn provided")
       set_filters(self.global_model, new_model)
+              # save resource totals for efficiency computation
+      self._round_resource[server_round] = {
+            "bytes_up": bytes_up,
+            "bytes_down": bytes_down,
+            "wall": wall,
+        }
       return new_model, metrics_aggregated
     
     def configure_evaluate(self, server_round: int, parameters, client_manager: ClientManager):
@@ -110,8 +151,36 @@ class fedprox_strategy(fl.server.strategy.FedAvg):
         if self.evaluate_metrics_aggregation_fn:
             eval_metrics = [(1, res.metrics) for _, res in results]
             metrics_aggregated = self.evaluate_metrics_aggregation_fn(eval_metrics)
+
+            prev_acc = self.accuracy_record[-1] if self.accuracy_record else 0.0
+            curr_acc = metrics_aggregated.get("accuracy", 0.0)
+            delta_acc = metrics_aggregated.get("accuracy", 0.0) - prev_acc
+            self.accuracy_record.append(curr_acc)
+
+            res = self._round_resource.get(server_round, {"bytes_up": 0, "bytes_down": 0, "wall": 0.0})
+            tot_bytes = res["bytes_up"] + res["bytes_down"]
+            self.total_bytes += tot_bytes
+            self.total_wall  += res["wall"]
+            delta_comm_eff = delta_acc / max(self.total_bytes, 1)
+            delta_comp_eff = delta_acc / max(self.total_wall, 1e-6)
+            comm_eff = curr_acc / max(self.total_bytes, 1)
+            comp_eff = curr_acc / max(self.total_wall, 1e-6)
+            self.efficiency_log.append((server_round, comm_eff, comp_eff))
+
             self.record_test_accuracy(metrics_aggregated['accuracy'])
-            print(f"Fedprox: Round {server_round}, test accuracy = {metrics_aggregated['accuracy']}")
+
+            log_lines = [
+                f"Round {server_round}: test_acc={curr_acc:.12f}, "
+                f"bytes={self.total_bytes/1e6:.8f} MB, time={self.total_wall:.8f}s, "
+                f"delta_acc/byte={delta_comm_eff:.12e}, delta_acc/sec={delta_comp_eff:.12f},"
+                f"acc/byte={comm_eff:.12e}, acc/sec={comp_eff:.12f}, "
+                "\n" 
+            ]
+
+
+            with open(log_filename, "a",  encoding="utf-8") as f:
+                    f.writelines(log_lines)
+
         elif server_round == 1:  # Only log this warning once
             log(WARNING, "No evaluate_metrics_aggregation_fn provided")
         return loss_aggregated, metrics_aggregated

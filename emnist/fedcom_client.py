@@ -6,10 +6,11 @@ from flwr.common import Code, EvaluateIns, EvaluateRes, FitRes, Status
 from models import CNN
 import torch
 from torch.utils.data import DataLoader, random_split
-from util import set_filters, get_filters, compute_update, top_k_sparsification
+from util import set_filters, get_filters, compute_update, top_k_sparsification, params_bytes
 from flwr.common import Code, EvaluateIns, EvaluateRes, FitIns, FitRes, Status
+import time 
 
-DEVICE = torch.device('cpu')
+DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 CLASSES = 62
 CHANNELS = 1
 
@@ -29,18 +30,33 @@ class fedcom_client(fl.client.Client):
         self.testloader = DataLoader(ds_val, self.local_batch_size, shuffle=False)
     
     def fit(self, ins: FitIns) -> FitRes:
-        # Deserialize parameters to NumPy ndarray's
-        sub_params = ins.parameters
-        set_filters(self.model, parameters_to_ndarrays(sub_params))
-        # masking channels:
+        global_params = parameters_to_ndarrays(ins.parameters)
+        set_filters(self.model, global_params)
+
+        tic = time.perf_counter()
         self.train()
-        # Serialize ndarray's into a Parameters object
-        updated_model = get_filters(self.model)
-        gradients = compute_update(updated_model, parameters_to_ndarrays(sub_params))
-        sparsed_gradients = top_k_sparsification(self.sub_model_rate, gradients)
-        new_residual = None
-        status = Status(code=Code.OK, message="Success")
-        return FitRes(status=status, parameters=ndarrays_to_parameters(sparsed_gradients), num_examples=len(self.trainloader), metrics={"Residual": new_residual, 'personal model': parameters_to_ndarrays(sub_params)})
+        train_time = time.perf_counter() - tic
+
+        updated = get_filters(self.model)
+        grad = compute_update(updated, global_params)
+        sparse_grad = top_k_sparsification(self.sub_model_rate, grad)
+
+        upload_bytes = params_bytes(sparse_grad)
+        download_bytes = params_bytes(global_params)
+
+        status = Status(Code.OK, "Success")
+        return FitRes(
+            status=status,
+            parameters=ndarrays_to_parameters(sparse_grad),
+            num_examples=len(self.trainloader),
+            metrics={
+                "upload_bytes": upload_bytes,
+                "download_bytes": download_bytes,
+                "train_time": train_time,
+                "Residual": None,
+                "personal model": global_params,
+            },
+        )
     
     def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
         # Deserialize parameters to NumPy ndarray's

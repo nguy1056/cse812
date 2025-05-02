@@ -18,10 +18,33 @@ from cifardataset import cifar10Dataset
 from es2 import get_topk_effectiveness, max_mean_dist_split
 import numpy as np
 from util import get_filters, get_orthogonal_distance, compute_update, get_relationship_update_this_round, get_parameters, set_filters, highest_consensus_this_round, get_cosine_similarity, weighted_average
+import logging
+import sys
+import os
+import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("training.log"),     # Write to log file
+        logging.StreamHandler(sys.stdout),       # Also print to console
+    ]
+)
+
+logger = logging.getLogger()
+
+# Create the 'results' folder if it doesn't exist
+os.makedirs("results", exist_ok=True)
+# Generate a unique timestamped filename
+timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+log_filename = f"results/FLrce_{timestamp_str}.txt"
+
 
 CHANNEL = 3
 Batch = 128
-DEVICE = torch.device("cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_EXPLOIT_RATE = 1.0
 DECAY_FACTOR = 1
 CLASSES = 10
@@ -61,6 +84,24 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
         self.relation_map_saving = []
         self.earlystopping_round_2 = 999
         self.non_filter_params = {}
+        self.cid_to_index = {}
+        self.next_index = 0
+        self.total_bytes = 0
+        self.total_wall = 0
+        self._round_resource = {}   
+        self.efficiency_log  = []
+    
+    def get_or_create_index(self, cid: str) -> int:
+        """Return a unique integer index (row/column) for this client id."""
+        if cid not in self.cid_to_index:
+            # If next_index has reached self.min_available_clients_, you’ve run out of space
+            # You can either raise an error or handle it gracefully.
+            if self.next_index >= self.min_available_clients_:
+                raise ValueError(f"No more space in relation_map for cid={cid}.")
+            self.cid_to_index[cid] = self.next_index
+            self.next_index += 1
+        return self.cid_to_index[cid]
+
 
     """override"""
     def initialize_parameters(self, client_manager: ClientManager):
@@ -129,7 +170,13 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
         updateDict = deepcopy(self.latest_local_updates)
         received_params = []
         Fitres = []
+        bytes_up, bytes_down, wall = 0, 0, 0.0
         for client, fit_res in results:
+            m = fit_res.metrics
+            bytes_up   += m.get("upload_bytes", 0)
+            bytes_down += m.get("download_bytes", 0)
+            wall       += m.get("train_time", 0.0)
+
             Fitres.append(fit_res)
             cid = client.cid
             selected_clients.append(cid)
@@ -142,8 +189,8 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
         for client_id, received_parameter in [(client.cid, parameters_to_ndarrays(fit_res.parameters)) for (client, fit_res) in results]:
             self.update_current_relationship(client_id, received_parameter, results)
         self.save_relationship()
-        consensus_update = get_relationship_update_this_round(results, oldmap, self.consesus)
-        hc = highest_consensus_this_round(results, oldmap, self.consesus)
+        consensus_update = get_relationship_update_this_round(results, oldmap, self.consesus, self.cid_to_index)
+        hc = highest_consensus_this_round(results, oldmap, self.consesus, self.cid_to_index)
         self.record_selected_clients(selected_clients)
         self.record_avg_consensus(consensus_update)
         self.record_hcp(hc)
@@ -167,6 +214,11 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
         elif server_round == 1:  # Only log this warning once
             log(WARNING, "No fit_metrics_aggregation_fn provided")
         set_filters(self.global_model, parameters_aggregated)
+        self._round_resource[server_round] = {
+            "bytes_up":   bytes_up,
+            "bytes_down": bytes_down,
+            "wall":       wall,
+        }
         self.highest_consensus.append(self.get_highest_consensus())
         return parameters_aggregated, metrics_aggregated
     
@@ -188,16 +240,57 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
         if self.evaluate_metrics_aggregation_fn:
             eval_metrics = [(1, res.metrics) for _, res in results]
             metrics_aggregated = self.evaluate_metrics_aggregation_fn(eval_metrics)
+
+            prev_acc = self.accuracy_record[-1] if self.accuracy_record else 0.0
+            curr_acc = metrics_aggregated.get("accuracy", 0.0)
+            delta_acc = metrics_aggregated.get("accuracy", 0.0) - prev_acc
+            self.accuracy_record.append(curr_acc)
+
+            res = self._round_resource.get(server_round, {"bytes_up": 0, "bytes_down": 0, "wall": 0.0})
+            tot_bytes = res["bytes_up"] + res["bytes_down"]
+            self.total_bytes += tot_bytes
+            self.total_wall  += res["wall"]
+            delta_comm_eff = delta_acc / max(self.total_bytes, 1)
+            delta_comp_eff = delta_acc / max(self.total_wall, 1e-6)
+            comm_eff = curr_acc / max(self.total_bytes, 1)
+            comp_eff = curr_acc / max(self.total_wall, 1e-6)
+            self.efficiency_log.append((server_round, comm_eff, comp_eff))
+
             self.record_test_accuracy(metrics_aggregated['accuracy'])
-            print(f"Round {server_round}, Exploit = {self.is_exploit_round}, test accuracy = {metrics_aggregated['accuracy']}")
-            if self.stopped:
-                if server_round == self.earlystopping_round:
-                    self.earlystopping_acc = metrics_aggregated['accuracy']
-                    self.record_criteria_acc_round()
-                else:
-                    print(f"stopped at {self.earlystopping_round} with an test accuracy of {self.earlystopping_acc}")
-        elif server_round == 1:  # Only log this warning once
+
+            log_lines = [
+                f"Round {server_round}: test_acc={curr_acc:.12f}, "
+                f"bytes={self.total_bytes/1e6:.8f} MB, time={self.total_wall:.8f}s, "
+                f"delta_acc/byte={delta_comm_eff:.12e}, delta_acc/sec={delta_comp_eff:.12f},"
+                f"acc/byte={comm_eff:.12e}, acc/sec={comp_eff:.12f}, "
+                "\n" 
+            ]
+
+            # Append early‑stop info only once
+            if self.stopped and server_round != self.earlystopping_round:
+                log_lines.append(
+                    f"Early Stopped at round {self.earlystopping_round}, "
+                    f"test accuracy = {self.earlystopping_acc}\n",
+                )
+            elif self.stopped and server_round == self.earlystopping_round:
+                self.earlystopping_acc = curr_acc
+                self.record_criteria_acc_round()
+
+            with open(log_filename, "a",  encoding="utf-8") as f:
+                f.writelines(log_lines)
+
+            # Console summary (one per round)
+            logger.info(
+                "Round %s | Exploit=%s | acc=%.4f | Δacc/byte=%.2e | Δacc/sec=%.2f",
+                server_round,
+                self.is_exploit_round,
+                curr_acc,
+                comm_eff,
+                comp_eff,
+            )
+        elif server_round == 1:
             log(WARNING, "No evaluate_metrics_aggregation_fn provided")
+            
         return loss_aggregated, metrics_aggregated
 
     def get_effectiveness_map(self):
@@ -269,17 +362,17 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
                 old_update = compute_update(current_global_parameter, starting_point)
                 local_update = self.latest_local_updates[k]
                 if server_round - last_round <= 1:
-                    self.relation_map[int(id)][int(k)] = (1-Alpha)*self.relation_map[int(id)][int(k)] + Alpha * get_cosine_similarity(this_update, local_update)
+                    self.relation_map[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))] = (1-Alpha)*self.relation_map[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))] + Alpha * get_cosine_similarity(this_update, local_update)
                 elif Decay_factor > 0.0:
                     distance1 = get_orthogonal_distance(old_update, local_update)
                     distance2 = get_orthogonal_distance(new_update, local_update)
                     new_value = max((distance1 - distance2) / (distance1 + 1e-5), -1)
-                    old_value = self.relation_map[int(id)][int(k)]
+                    old_value = self.relation_map[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))]
                     if new_value >= old_value:
-                        self.consesus[int(id)][int(k)] = 1
+                        self.consesus[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))] = 1
                     else:
-                        self.consesus[int(id)][int(k)] = -1
-                    self.relation_map[int(id)][int(k)] = (1-Alpha)*old_value + Alpha * new_value * math.pow(DECAY_FACTOR, server_round-last_round+1)
+                        self.consesus[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))] = -1
+                    self.relation_map[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))] = (1-Alpha)*old_value + Alpha * new_value * math.pow(DECAY_FACTOR, server_round-last_round+1)
 
     def update_current_relationship(self, id:str, my_parameter, results, Alpha=0.9):
         if len(results) > 1:
@@ -290,12 +383,13 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
                 new_local_parameter = parameters_to_ndarrays(fitres.parameters)
                 local_update = compute_update(new_local_parameter, global_parameter)
                 new_value = get_cosine_similarity(local_update, this_update)
-                old_value = self.relation_map[int(id)][int(k)]
+                old_value = self.relation_map[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))]
                 if new_value >= old_value:
-                    self.consesus[int(id)][int(k)] = 1
+                    self.consesus[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))] = 1
                 else:
-                    self.consesus[int(id)][int(k)] = -1
-                self.relation_map[int(id)][int(k)] = (1-Alpha)*old_value + Alpha*new_value
+                    self.consesus[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))] = -1
+                self.relation_map[self.get_or_create_index(str(id))][self.get_or_create_index(str(k))] = (1-Alpha)*old_value + Alpha*new_value
+
 
     def get_highest_consensus(self) -> int:
         highest_value = -self.min_available_clients_

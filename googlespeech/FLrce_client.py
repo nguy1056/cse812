@@ -4,10 +4,12 @@ from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.common import Code, EvaluateIns, EvaluateRes, FitRes, Status
 # other dependecies:
 from models import CNN
+import time
 import torch
 from torch.utils.data import DataLoader, random_split
 from typing import Dict
 from util import set_filters, get_filters
+from util import params_bytes
 from flwr.common import Code, EvaluateIns, EvaluateRes, FitIns, FitRes, Status
 from flwr.server.client_manager import SimpleClientManager
 from typing import Dict, Optional
@@ -16,7 +18,7 @@ from flwr.common.logger import log
 from flwr.server.criterion import Criterion
 import numpy as np
 
-DEVICE = torch.device("cpu") # Try "cuda" to train on GPU
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CLASSES = 35
 CHANNELS = 1
 
@@ -34,13 +36,30 @@ class FLrce_client(fl.client.Client):
     
     def fit(self, ins: FitIns) -> FitRes:
         # Deserialize parameters to NumPy ndarray's
-        params = ins.parameters
-        set_filters(self.model, parameters_to_ndarrays(params))
+        global_params_nd = parameters_to_ndarrays(ins.parameters)
+        set_filters(self.model, global_params_nd)
         #_, accuracy = self.test()
+
+        #count time
+        local_time = time.perf_counter()
         self.train()
-        parameters_updated = get_filters(self.model)
+        train_time = time.perf_counter() - local_time
+
+        updated_nd = get_filters(self.model)          # full model upload
+        upload_bytes   = params_bytes(updated_nd)
+        download_bytes = params_bytes(global_params_nd)
+
         status = Status(code=Code.OK, message="Success")
-        return FitRes(status=status, parameters=ndarrays_to_parameters(parameters_updated), num_examples=len(self.trainloader), metrics={},)
+        return FitRes(status=status, 
+                      parameters=ndarrays_to_parameters(updated_nd), 
+                      num_examples=len(self.trainloader),         
+                      metrics={
+                        "upload_bytes":   upload_bytes,
+                        "download_bytes": download_bytes,
+                        "train_time":     train_time,
+                        # "accuracy":     local_acc,   # keep if you already report it
+                      },
+        )
     
     def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
         # Deserialize parameters to NumPy ndarray's

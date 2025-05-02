@@ -4,25 +4,25 @@ from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.common import Code, EvaluateIns, EvaluateRes, FitRes, Status
 # other dependecies:
 from models import CNN
+import time
 import torch
 from torch.utils.data import DataLoader, random_split
 from typing import Dict
-from util import set_filters, get_filters, params_bytes
+from util import set_filters, get_filters
+from util import params_bytes
 from flwr.common import Code, EvaluateIns, EvaluateRes, FitIns, FitRes, Status
 from flwr.server.client_manager import SimpleClientManager
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 from logging import INFO
 from flwr.common.logger import log
 from flwr.server.criterion import Criterion
 import numpy as np
-import time
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CLASSES = 35
+CHANNELS = 1
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Try "cuda" to train on GPU
-CLASSES = 100
-CHANNELS = 3
-
-class FLrce_client(fl.client.Client):
+class FLrceSPRT_client(fl.client.Client):
     def __init__(self, cid, dataset, epoch, batch):
         self.cid = cid
         self.model = CNN(in_channels=CHANNELS, outputs=CLASSES).to(DEVICE)
@@ -30,7 +30,7 @@ class FLrce_client(fl.client.Client):
         self.local_batch_size= batch
         len_train = int(len(dataset) * 0.7)
         len_test = len(dataset) - len_train
-        ds_train, ds_val = random_split(dataset, [len_train, len_test], torch.Generator().manual_seed(1704))
+        ds_train, ds_val = random_split(dataset, [len_train, len_test], torch.Generator().manual_seed(2116))
         self.trainloader = DataLoader(ds_train, self.local_batch_size, shuffle=True)
         self.testloader = DataLoader(ds_val, self.local_batch_size, shuffle=False)
     
@@ -78,7 +78,7 @@ class FLrce_client(fl.client.Client):
     
     def train(self):
         criterion = torch.nn.CrossEntropyLoss()
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.5)
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=5e-4)
         self.model.train()
         for e in range(self.local_epoch):
             for samples, labels in self.trainloader:
@@ -106,7 +106,7 @@ class FLrce_client(fl.client.Client):
         accuracy = correct / total
         return loss, accuracy
 
-class FLrce_client_manager(SimpleClientManager):
+class FLrceSPRT_client_manager(SimpleClientManager):
     def sample(self, num_clients, exploit_factor:Optional[float]=None, utility_scores_map:Optional[Dict]=None, explore_map:Optional[Dict]=None, min_num_clients:Optional[int]=None, criterion:Optional[Criterion]=None):
         # Block until at least num_clients are connected.
         if exploit_factor == None or utility_scores_map == None or len(utility_scores_map) == 0:

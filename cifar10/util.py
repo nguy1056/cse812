@@ -424,3 +424,9 @@ def generate_filters_random(global_model:torch.nn.Module, rate):
             drop_information[name] = non_masked_filter_ids
             subparams.append(sub_param.numpy())
     return drop_information, subparams
+
+def tensor_bytes(t: torch.Tensor) -> int:
+    return t.numel() * t.element_size()
+
+def params_bytes(param_list: List[np.ndarray]) -> int:
+    return sum(p.size * p.itemsize for p in param_list)

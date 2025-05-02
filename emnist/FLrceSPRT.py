@@ -1,6 +1,6 @@
 from typing import List, Tuple, Union, Dict
 from models import CNN
-from FLrce_client import FLrce_client
+from FLrceSPRT_client import FLrceSPRT_client
 import random
 import math
 import torch
@@ -39,7 +39,7 @@ logger = logging.getLogger()
 os.makedirs("results", exist_ok=True)
 # Generate a unique timestamped filename
 timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-log_filename = f"results/FLrce_{timestamp_str}.txt"
+log_filename = f"results/FLrceSPRT_{timestamp_str}.txt"
 
 CHANNEL = 1
 Batch = 16
@@ -48,8 +48,11 @@ MAX_EXPLOIT_RATE = 1.0
 DECAY_FACTOR = 1
 CLASSES = 62
 
-class FLrce_strategy(fl.server.strategy.FedAvg):
-    def __init__(self, ff, fe, mfc, mec, mac, accuracies=[], ClientsSelection=[], HighestConsensus=[], AvgConsensus=[], HCperround=[], ESCriteria=[]):
+class FLrceSPRT_strategy(fl.server.strategy.FedAvg):
+    def __init__(self, ff, fe, mfc, mec, mac, accuracies=[], ClientsSelection=[], HighestConsensus=[], AvgConsensus=[], HCperround=[], ESCriteria=[], 
+        alpha: float = 0.05,     
+        beta: float = 0.10,       
+        delta: float = 0.003, ):
         super().__init__(fraction_fit=ff, fraction_evaluate=fe, min_fit_clients=mfc, min_evaluate_clients=mec, min_available_clients=mac, evaluate_metrics_aggregation_fn=weighted_average)
         self.fraction_fit_=ff,
         self.fraction_evaluate_=fe,
@@ -76,6 +79,7 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
         self.earlystopping_acc = 0.0
         self.early_stopping_criteria = ESCriteria
         self.EarlyStoppingCriterias = iter([4.5, 5, 5.5, 6])
+        self.conflict_threshold = 5
         self.es_criteria = next(self.EarlyStoppingCriterias, -1)
         self.best_model = CNN(CHANNEL, outputs=CLASSES)
         self.highest_test_acc = 0.4
@@ -89,6 +93,18 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
         self.total_wall = 0
         self._round_resource = {}   
         self.efficiency_log  = []
+
+        # SPRT constants
+        self.alpha = alpha
+        self.beta = beta
+        self.delta = delta
+        self.A = math.log((1.0 - beta) / alpha)  
+        self.B = math.log(beta / (1.0 - alpha))  
+        self.LR = 0.0                          
+        self.sigma2 = 1e-5                      
+        self.n_var = 0     
+        self.sum = 0.0   
+        self.mean_r = 0.0    
     
     def get_or_create_index(self, cid: str) -> int:
         """Return a unique integer index (row/column) for this client id."""
@@ -162,6 +178,8 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
             return None, {}
         if not self.accept_failures and failures:
             return None, {}
+        self.latest_conflict = self.get_conflicts(results)
+
         selected_clients = []
         current_parameter = get_filters(self.global_model)
         oldmap = deepcopy(self.consesus)
@@ -192,17 +210,17 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
         self.record_selected_clients(selected_clients)
         self.record_avg_consensus(consensus_update)
         self.record_hcp(hc)
-        conflicts = self.get_conflicts(results)
-        if self.is_exploit_round:
-            topk_effectiveness = get_topk_effectiveness(self.min_available_clients_, self.relation_map, len(results))
-            if self.es_criteria > 0 and conflicts >= self.es_criteria:
-                self.earlystopping_round =server_round
-                self.stopped = True
-                self.es_criteria = next(self.EarlyStoppingCriterias, -1)
-            elif self.es_criteria > 0 and conflicts >= self.es_criteria - 0.5:
-                if max_mean_dist_split(topk_effectiveness) <= 1:
-                    self.earlystopping_round_2 = server_round
-                    self.record_criteria_acc_round()
+        # conflicts = self.get_conflicts(results)
+        # if self.is_exploit_round:
+        #     topk_effectiveness = get_topk_effectiveness(self.min_available_clients_, self.relation_map, len(results))
+        #     if self.es_criteria > 0 and conflicts >= self.es_criteria:
+        #         self.earlystopping_round =server_round
+        #         self.stopped = True
+        #         self.es_criteria = next(self.EarlyStoppingCriterias, -1)
+        #     elif self.es_criteria > 0 and conflicts >= self.es_criteria - 0.5:
+        #         if max_mean_dist_split(topk_effectiveness) <= 1:
+        #             self.earlystopping_round_2 = server_round
+        #             self.record_criteria_acc_round()
         parameters_aggregated = aggregate(received_params)
         # Aggregate custom metrics if aggregation fn was provided
         metrics_aggregated = {}
@@ -235,6 +253,7 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
             ]
         )
         metrics_aggregated = {}
+        log_lines: List[str] = []
         if self.evaluate_metrics_aggregation_fn:
             eval_metrics = [(1, res.metrics) for _, res in results]
             metrics_aggregated = self.evaluate_metrics_aggregation_fn(eval_metrics)
@@ -243,6 +262,19 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
             curr_acc = metrics_aggregated.get("accuracy", 0.0)
             delta_acc = metrics_aggregated.get("accuracy", 0.0) - prev_acc
             self.accuracy_record.append(curr_acc)
+
+            #SPRT
+            r_t = curr_acc - prev_acc
+            sprt_stop = self.update_SPRT(r_t)
+            conflict_stop = self.latest_conflict >= self.conflict_threshold
+            stop_flag = sprt_stop and conflict_stop
+            if stop_flag:
+                self.stopped = True
+                self.earlystopping_round = server_round
+                self.earlystopping_acc = curr_acc
+                log_lines.append(
+                    "SPRT stop at round {} | acc={:.4f} | LR={:.2f}\n".format(server_round, curr_acc, self.LR)
+                )
 
             res = self._round_resource.get(server_round, {"bytes_up": 0, "bytes_down": 0, "wall": 0.0})
             tot_bytes = res["bytes_up"] + res["bytes_down"]
@@ -256,13 +288,14 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
 
             self.record_test_accuracy(metrics_aggregated['accuracy'])
 
-            log_lines = [
+            log_lines.extend( [
                 f"Round {server_round}: test_acc={curr_acc:.12f}, "
                 f"bytes={self.total_bytes/1e6:.8f} MB, time={self.total_wall:.8f}s, "
                 f"delta_acc/byte={delta_comm_eff:.12e}, delta_acc/sec={delta_comp_eff:.12f},"
                 f"acc/byte={comm_eff:.12e}, acc/sec={comp_eff:.12f}, "
                 "\n" 
             ]
+            )
 
             # Append early‑stop info only once
             if self.stopped and server_round != self.earlystopping_round:
@@ -412,6 +445,23 @@ class FLrce_strategy(fl.server.strategy.FedAvg):
                     if get_cosine_similarity(local_update, local_update_k) <= 0.0:
                         total += 1
         return total / max(num_clients, 1) 
+    
+    def update_SPRT(self, r_t: float) -> bool:
+        self.n_var += 1
+        if self.n_var == 1:
+            self.mean_r = r_t
+            self.sum     = 0.0     
+        else:
+            delta      = r_t - self.mean_r
+            self.mean_r += delta / self.n_var
+            self.sum    += delta * (r_t - self.mean_r)
+        self.sigma2 = max(self.sum / (self.n_var - 1 + 1e-9), 1e-6)
+
+        ll_h1 = -((r_t - self.delta) ** 2) / (2 * self.sigma2)
+        ll_h0 = -(r_t ** 2) / (2 * self.sigma2)
+        self.LR += ll_h1 - ll_h0
+
+        return self.LR >= self.A or self.LR <= self.B
 
 def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
   # Multiply accuracy of each client by number of examples used
@@ -420,7 +470,7 @@ def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
   # Aggregate and return custom metric (weighted average)
   return {"accuracy": sum(accuracies) / sum(examples)}
 
-def FLrce_client_fn(cid) -> FLrce_client:
+def FLrceSPRT_client_fn(cid) -> FLrceSPRT_client:
   Epoch = 5
   dataset = EmnistDataset("clientdata/femnist_client_"+ str(cid) + "_ALPHA_0.1.csv")
-  return FLrce_client(cid, dataset, Epoch, Batch)
+  return FLrceSPRT_client(cid, dataset, Epoch, Batch)
